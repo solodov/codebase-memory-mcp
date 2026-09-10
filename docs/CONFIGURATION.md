@@ -90,6 +90,19 @@ Current keys:
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
 
+A permanent daemon started with `daemon start` also owns watches independently of
+MCP sessions. It discovers cached project identities at startup and reconciles
+the set on polling ticks, at most once every 30 seconds. New watches request one
+catch-up index so changes made while the daemon was stopped are not missed;
+subsequent updates use the existing Git change detection. Indexing can delay
+polling, so this is not a real-time freshness guarantee. Non-Git projects remain
+unsupported by the watcher.
+
+These daemon-owned watches honor `watcher_enabled`, not `auto_watch`. Temporary,
+session-managed daemons keep their existing session-owned lifetimes. Missing or
+unsafe roots are not enrolled, and removing a daemon watch does not itself delete
+the cached database.
+
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
 > narrower: it only controls whether a connecting session registers *its own*

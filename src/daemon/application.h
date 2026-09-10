@@ -107,6 +107,12 @@ cbm_daemon_application_t *cbm_daemon_application_new(const cbm_daemon_applicatio
  * stop/drain paths latch it stopping. */
 void cbm_daemon_application_set_permanent(cbm_daemon_application_t *application, bool permanent);
 
+/* Reconcile permanent-daemon owners against cached project identities. No-op
+ * for session-managed daemons or a disabled watcher. Call serially from the
+ * watcher thread before polling; join that thread before freeing application.
+ * Failed scans preserve unvisited owners and can be retried on the next tick. */
+bool cbm_daemon_application_reconcile_watches(cbm_daemon_application_t *application);
+
 /* Cancel and reap all daemon-owned operations within timeout_ms. Normal final
  * client shutdown calls this before watcher/store teardown. Idempotent. */
 bool cbm_daemon_application_shutdown(cbm_daemon_application_t *application, uint32_t timeout_ms);
@@ -164,9 +170,9 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_hook_augme
     uint32_t *response_length_out, uint32_t timeout_ms);
 
 /* Watcher callback: atomically validates project/root ownership and subscribes
- * the shared physical job to every exact live session watch. The callback is
- * only a result waiter, so disconnecting the final matching owner cancels the
- * job even while unrelated daemon sessions remain. Returns 0 on success,
+ * the shared physical job to its exact session and permanent-daemon owners.
+ * The callback is only a result waiter; losing the final owner cancels the job
+ * even while unrelated daemon sessions remain. Returns 0 on success,
  * positive when stale, cancelled, or busy (retry), and negative on a terminal
  * worker error. */
 int cbm_daemon_application_watcher_index(const char *project_name, const char *root_path,

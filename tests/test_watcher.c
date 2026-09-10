@@ -11,6 +11,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <daemon/application.h>
+#include <mcp/mcp.h>
 #include <watcher/watcher.h>
 #include <pipeline/artifact.h>
 #include <store/store.h>
@@ -662,7 +663,7 @@ TEST(watcher_stop_flag) {
     cbm_watcher_stop(w);
 
     /* Run should return immediately */
-    int rc = cbm_watcher_run(w, 1000);
+    int rc = cbm_watcher_run(w, 1000, NULL, NULL);
     ASSERT_EQ(rc, 0);
 
     cbm_watcher_free(w);
@@ -696,7 +697,7 @@ typedef struct {
 
 static void *watcher_windows_blocked_run_thread(void *opaque) {
     watcher_windows_blocked_run_t *run = opaque;
-    (void)cbm_watcher_run(run->watcher, 10);
+    (void)cbm_watcher_run(run->watcher, 10, NULL, NULL);
     atomic_store_explicit(&run->completed, true, memory_order_release);
     return NULL;
 }
@@ -859,7 +860,7 @@ typedef struct {
 
 static void *watcher_blocked_run_thread(void *opaque) {
     watcher_blocked_run_t *run = opaque;
-    (void)cbm_watcher_run(run->watcher, 10);
+    (void)cbm_watcher_run(run->watcher, 10, NULL, NULL);
     atomic_store_explicit(&run->completed, true, memory_order_release);
     return NULL;
 }
@@ -1803,6 +1804,126 @@ static int failing_index_callback(const char *name, const char *path, void *ud) 
         return -1; /* simulated pipeline failure */
     }
     return 0;
+}
+
+typedef struct {
+    cbm_watcher_t *watcher;
+    int calls;
+} catch_up_probe_t;
+
+static int catch_up_index(const char *project, const char *root, void *opaque) {
+    catch_up_probe_t *probe = opaque;
+    probe->calls++;
+    if (probe->calls == 1) {
+        return 1; /* busy */
+    }
+    if (probe->calls == 2) {
+        return -1; /* failed */
+    }
+    if (probe->calls == 3) {
+        /* A request arriving during indexing must survive this success. */
+        cbm_watcher_request_catch_up(probe->watcher, project);
+    }
+    return 0;
+}
+
+TEST(watcher_clean_startup_catch_up_retries_until_success) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s/cbm-watcher-catch-up-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    ASSERT_EQ(wt_git(root, "init -q"), 0);
+    ASSERT_EQ(wt_git(root, "commit -q --allow-empty -m initial"), 0);
+    cbm_store_t *store = cbm_store_open_memory();
+    catch_up_probe_t probe = {0};
+    cbm_watcher_t *watcher = cbm_watcher_new(store, catch_up_index, &probe);
+    probe.watcher = watcher;
+    ASSERT_TRUE(cbm_watcher_watch(watcher, "catch-up", root));
+    cbm_watcher_request_catch_up(watcher, "catch-up");
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 0); /* initial clean HEAD baseline */
+    int results[5];
+    for (int i = 0; i < 5; i++) {
+        cbm_watcher_touch(watcher, "catch-up");
+        results[i] = cbm_watcher_poll_once(watcher);
+    }
+    cbm_watcher_stop(watcher);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    th_rmtree(root);
+    ASSERT_EQ(probe.calls, 4);
+    ASSERT_EQ(results[0], 0);
+    ASSERT_EQ(results[1], 0);
+    ASSERT_EQ(results[2], 1);
+    ASSERT_EQ(results[3], 1);
+    ASSERT_EQ(results[4], 0);
+    PASS();
+}
+
+static bool visit_canonical_project(const char *project, const char *root, const char *db_path,
+                                    void *context) {
+    int *count = context;
+    (*count)++;
+    return strcmp(project, "project") == 0 && strstr(db_path, "/project.db") != NULL;
+}
+
+TEST(watcher_permanent_discovery_catches_up_once_despite_duplicate_cache_files) {
+    char root[256], cache[300], db_path[350], copy_path[350];
+    snprintf(root, sizeof(root), "%s/cbm-permanent-watch-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    snprintf(cache, sizeof(cache), "%s/cache", root);
+    snprintf(db_path, sizeof(db_path), "%s/project.db", cache);
+    snprintf(copy_path, sizeof(copy_path), "%s/copy.db", cache);
+    ASSERT_EQ(cbm_mkdir(cache), 0);
+    ASSERT_EQ(wt_git(root, "init -q"), 0);
+    ASSERT_EQ(wt_git(root, "commit -q --allow-empty -m initial"), 0);
+    char ignore[300];
+    th_write_file(wt_path(ignore, sizeof(ignore), root, ".git/info/exclude"), "cache/\n");
+    const char *previous = getenv("CBM_CACHE_DIR");
+    char *saved = previous ? strdup(previous) : NULL;
+    ASSERT_TRUE(!previous || saved);
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_store_t *db = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(cbm_store_upsert_project(db, "project", root), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(db, "project::missed", ""), CBM_STORE_OK);
+    cbm_store_close(db);
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, index_callback, NULL);
+    cbm_daemon_application_config_t config = {.watcher = watcher};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_application_set_permanent(application, true);
+    index_call_count = 0;
+    bool restored = cbm_daemon_application_reconcile_watches(application);
+    int count = cbm_watcher_watch_count(watcher);
+    cbm_watcher_poll_once(watcher);
+    cbm_watcher_touch(watcher, "project");
+    int catch_up = cbm_watcher_poll_once(watcher);
+    db = cbm_store_open_path(copy_path);
+    bool copied = db && cbm_store_upsert_project(db, "project", cache) == CBM_STORE_OK;
+    cbm_store_close(db);
+    int identities = 0;
+    bool canonical = cbm_mcp_visit_cached_projects(visit_canonical_project, &identities);
+    bool reconciled = cbm_daemon_application_reconcile_watches(application);
+    cbm_watcher_touch(watcher, "project");
+    int idle = cbm_watcher_poll_once(watcher);
+    int calls = index_call_count;
+    bool freed = cbm_daemon_application_free(application);
+    cbm_watcher_stop(watcher);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    if (saved) {
+        cbm_setenv("CBM_CACHE_DIR", saved, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved);
+    th_rmtree(root);
+    ASSERT_TRUE(restored && copied && canonical && reconciled && freed);
+    ASSERT_EQ(identities, 1);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(catch_up, 1);
+    ASSERT_EQ(idle, 0);
+    ASSERT_EQ(calls, 1);
+    PASS();
 }
 
 TEST(watcher_failed_reindex_retries_issue937) {
@@ -2971,7 +3092,7 @@ TEST(watcher_stop_prevents_run) {
     cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
 
     cbm_watcher_stop(w);
-    int rc = cbm_watcher_run(w, 60000);
+    int rc = cbm_watcher_run(w, 60000, NULL, NULL);
     ASSERT_EQ(rc, 0);
 
     cbm_watcher_free(w);
@@ -3306,6 +3427,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_no_change_no_reindex);
     RUN_TEST(watcher_own_artifact_export_does_not_retrigger_issue1953);
     RUN_TEST(watcher_dirty_state_reindexes_once_issue937);
+    RUN_TEST(watcher_clean_startup_catch_up_retries_until_success);
+    RUN_TEST(watcher_permanent_discovery_catches_up_once_despite_duplicate_cache_files);
     RUN_TEST(watcher_failed_reindex_retries_issue937);
     RUN_TEST(watcher_multiple_projects);
 

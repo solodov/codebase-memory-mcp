@@ -13,6 +13,7 @@
 #include "foundation/platform.h"
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
+#include "foundation/str_util.h"
 #include "foundation/subprocess.h"
 #include "foundation/workspace.h"
 #include "mcp/index_supervisor.h"
@@ -98,6 +99,9 @@ typedef enum {
 struct cbm_daemon_application_watch {
     char *project;
     char *root;
+    /* Non-NULL is the permanent daemon's ownership, independent of sessions. */
+    char *daemon_db_path;
+    bool daemon_seen;
     size_t subscribers;
     cbm_daemon_application_watch_t *next;
 };
@@ -150,13 +154,12 @@ struct cbm_daemon_application_job {
     cbm_daemon_application_job_t *next;
 };
 
-/* A watcher-triggered physical job is owned by the exact live sessions that
- * currently subscribe to its project/root watch. The callback waiting for the
- * job is only a storage waiter; it is deliberately not an ownership
- * subscription, so the worker is cancelled when the last matching session
- * disconnects even while unrelated daemon sessions remain alive. */
+/* Each exact live watch owner subscribes to the physical job. The callback
+ * itself is only a storage waiter. A subscription has either a session owner
+ * or a daemon-owned watch, never both. */
 struct cbm_daemon_application_watch_job_subscription {
     cbm_daemon_application_session_t *session;
+    cbm_daemon_application_watch_t *watch;
     cbm_daemon_application_job_t *job;
     cbm_daemon_application_watch_job_subscription_t *next;
 };
@@ -200,6 +203,10 @@ struct cbm_daemon_application {
 };
 
 static void application_job_unsubscribe_locked(cbm_daemon_application_job_t *job);
+static void application_release_daemon_watch_locked(cbm_daemon_application_t *application,
+                                                    cbm_daemon_application_watch_t *watch);
+static cbm_daemon_application_watch_t *application_register_watch_locked(
+    cbm_daemon_application_t *application, const char *project, const char *root);
 static void application_watch_job_unsubscribe_session_locked(
     cbm_daemon_application_session_t *session);
 static bool application_watch_job_subscribe_late_session_locked(
@@ -400,6 +407,7 @@ static void application_remove_watch_entry_locked(cbm_daemon_application_t *appl
         return;
     }
     *cursor = watch->next;
+    application_release_daemon_watch_locked(application, watch);
     for (cbm_daemon_application_session_t *session = application->sessions; session;
          session = session->next) {
         if (session->watch == watch) {
@@ -430,7 +438,7 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
     if (watch->subscribers > 0) {
         watch->subscribers--;
     }
-    if (watch->subscribers == 0) {
+    if (watch->subscribers == 0 && !watch->daemon_db_path) {
         application_remove_watch_locked(session->application, watch);
     }
 }
@@ -481,9 +489,13 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
     }
     cbm_daemon_application_watch_t *watch = application_find_watch_locked(application, project);
     if (!enabled || !db_exists) {
-        /* A delete/config transition is global for this project. Remove the
-         * physical watch and clear every logical subscriber in one step. */
-        if (watch) {
+        /* Preserve permanent ownership; otherwise retain the session-managed
+         * delete/config behavior of clearing the project's subscriptions. */
+        if (watch && watch->daemon_db_path) {
+            /* auto_watch only governs session ownership. Cached-project
+             * reconciliation governs the permanent daemon's owner. */
+            application_release_session_watch_locked(session);
+        } else if (watch) {
             application_remove_watch_locked(application, watch);
         }
         return;
@@ -507,7 +519,17 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
         return;
     }
 
-    watch = calloc(1, sizeof(*watch));
+    watch = application_register_watch_locked(application, project, root);
+    if (watch) {
+        watch->subscribers++;
+        session->watch = watch;
+    }
+}
+
+/* Caller holds application->mutex; physical registration is the commit point. */
+static cbm_daemon_application_watch_t *application_register_watch_locked(
+    cbm_daemon_application_t *application, const char *project, const char *root) {
+    cbm_daemon_application_watch_t *watch = calloc(1, sizeof(*watch));
     if (watch) {
         watch->project = strdup(project);
         watch->root = strdup(root);
@@ -518,7 +540,7 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
             free(watch->root);
             free(watch);
         }
-        return;
+        return NULL;
     }
     /* Physical registration is the commit point. Never publish a logical
      * subscription that the shared watcher failed to install. */
@@ -527,12 +549,11 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
         free(watch->project);
         free(watch->root);
         free(watch);
-        return;
+        return NULL;
     }
-    watch->subscribers = 1;
     watch->next = application->watches;
     application->watches = watch;
-    session->watch = watch;
+    return watch;
 }
 
 static void application_refresh_watch(cbm_daemon_application_session_t *session) {
@@ -2176,10 +2197,10 @@ static bool application_watch_job_subscribe_late_session_locked(
 /* Caller holds application->mutex. Allocate the complete change before
  * publishing any node so an allocation failure never leaves only a subset of
  * the exact live watch owners subscribed. */
-static bool application_watch_job_subscribe_sessions_locked(cbm_daemon_application_t *application,
-                                                            cbm_daemon_application_watch_t *watch,
-                                                            cbm_daemon_application_job_t *job,
-                                                            size_t *matched_out) {
+static bool application_watch_job_subscribe_owners_locked(cbm_daemon_application_t *application,
+                                                          cbm_daemon_application_watch_t *watch,
+                                                          cbm_daemon_application_job_t *job,
+                                                          size_t *matched_out) {
     *matched_out = 0;
     if (!watch || !job || strcmp(watch->project, job->project_key) != 0 ||
         strcmp(watch->root, job->root_path) != 0) {
@@ -2187,6 +2208,17 @@ static bool application_watch_job_subscribe_sessions_locked(cbm_daemon_applicati
     }
 
     cbm_daemon_application_watch_job_subscription_t *pending = NULL;
+    if (watch->daemon_db_path) {
+        (*matched_out)++;
+        if (!application_watch_job_subscription_exists_locked(application, NULL, job)) {
+            pending = calloc(1, sizeof(*pending));
+            if (!pending) {
+                return false;
+            }
+            pending->watch = watch;
+            pending->job = job;
+        }
+    }
     for (cbm_daemon_application_session_t *session = application->sessions; session;
          session = session->next) {
         if (session->session_cancelled || !session->context_set || session->watch != watch) {
@@ -2939,6 +2971,124 @@ static void application_session_close(void *context,
     free(session);
 }
 
+static bool application_visit_daemon_watch(const char *project, const char *root,
+                                           const char *db_path, void *context);
+
+bool cbm_daemon_application_reconcile_watches(cbm_daemon_application_t *application) {
+    if (!application) {
+        return false;
+    }
+    cbm_mutex_lock(&application->mutex);
+    if (!application->permanent || !application->watcher || application->stopping) {
+        cbm_mutex_unlock(&application->mutex);
+        return true;
+    }
+    for (cbm_daemon_application_watch_t *watch = application->watches; watch; watch = watch->next) {
+        watch->daemon_seen = false;
+    }
+    cbm_mutex_unlock(&application->mutex);
+
+    /* Read identities outside the application lock. A failed/partial scan
+     * must never release owners merely because their database was not visited. */
+    if (!cbm_mcp_visit_cached_projects(application_visit_daemon_watch, application)) {
+        return false;
+    }
+    cbm_mutex_lock(&application->mutex);
+    cbm_daemon_application_watch_t *watch = application->watches;
+    while (watch) {
+        cbm_daemon_application_watch_t *next = watch->next;
+        if (watch->daemon_db_path && !watch->daemon_seen) {
+            application_release_daemon_watch_locked(application, watch);
+            if (watch->subscribers == 0) {
+                application_remove_watch_locked(application, watch);
+            }
+        }
+        watch = next;
+    }
+    cbm_mutex_unlock(&application->mutex);
+    return true;
+}
+
+/* Cached metadata grants no exception to the automatic-workspace boundary. */
+static bool application_visit_daemon_watch(const char *project, const char *root,
+                                           const char *db_path, void *context) {
+    cbm_daemon_application_t *application = context;
+    char canonical_root[APPLICATION_PATH_CAP];
+    char boundary_error[CBM_SZ_1K];
+    if (!cbm_validate_project_name(project) || !root || !root[0] ||
+        !cbm_canonical_path(root, canonical_root, sizeof(canonical_root)) ||
+        !application_canonical_directory_exists(canonical_root) ||
+        !cbm_workspace_root_allowed(canonical_root, cbm_workspace_home_dir(),
+                                    cbm_workspace_cache_dir(), NULL, boundary_error,
+                                    sizeof(boundary_error))) {
+        return true;
+    }
+    cbm_mutex_lock(&application->mutex);
+    if (application->stopping) {
+        cbm_mutex_unlock(&application->mutex);
+        return false;
+    }
+    cbm_daemon_application_watch_t *watch = application_find_watch_locked(application, project);
+    if (watch && watch->daemon_db_path && strcmp(watch->daemon_db_path, db_path) != 0) {
+        /* Renamed/copied cache files can advertise the same project. Retain
+         * the selected identity until it disappears from a complete scan;
+         * alternating copies would rearm catch-up on every refresh. */
+        cbm_mutex_unlock(&application->mutex);
+        return true;
+    }
+    if (application_mutation_conflicts_locked(application, project) ||
+        application_job_reserves_project_locked(application, project)) {
+        if (watch) {
+            watch->daemon_seen = true;
+        }
+        cbm_mutex_unlock(&application->mutex);
+        return true;
+    }
+    if (watch && strcmp(watch->root, canonical_root) != 0) {
+        application_remove_watch_locked(application, watch);
+        watch = NULL;
+    }
+    if (!watch) {
+        watch = application_register_watch_locked(application, project, canonical_root);
+    }
+    bool ok = watch != NULL;
+    if (watch && !watch->daemon_db_path) {
+        char *copy = strdup(db_path);
+        ok = copy != NULL;
+        if (copy) {
+            watch->daemon_db_path = copy;
+            cbm_watcher_request_catch_up(application->watcher, project);
+        } else if (watch->subscribers == 0) {
+            application_remove_watch_locked(application, watch);
+            watch = NULL;
+        }
+    }
+    if (watch) {
+        watch->daemon_seen = true;
+    }
+    cbm_mutex_unlock(&application->mutex);
+    return ok;
+}
+
+/* Release the daemon's watch and job ownership, retaining any session owners. */
+static void application_release_daemon_watch_locked(cbm_daemon_application_t *application,
+                                                    cbm_daemon_application_watch_t *watch) {
+    cbm_daemon_application_watch_job_subscription_t **cursor =
+        &application->watch_job_subscriptions;
+    while (*cursor) {
+        cbm_daemon_application_watch_job_subscription_t *subscription = *cursor;
+        if (subscription->watch != watch) {
+            cursor = &subscription->next;
+            continue;
+        }
+        *cursor = subscription->next;
+        application_job_unsubscribe_locked(subscription->job);
+        free(subscription);
+    }
+    free(watch->daemon_db_path);
+    watch->daemon_db_path = NULL;
+}
+
 void cbm_daemon_application_set_permanent(cbm_daemon_application_t *application, bool permanent) {
     if (!application) {
         return;
@@ -3140,6 +3290,7 @@ bool cbm_daemon_application_free_with_timeout(cbm_daemon_application_t *applicat
         }
         free(watches->project);
         free(watches->root);
+        free(watches->daemon_db_path);
         free(watches);
         watches = next;
     }
@@ -3482,8 +3633,16 @@ static int application_background_index(cbm_daemon_application_t *application,
     cbm_mutex_lock(&application->mutex);
     cbm_daemon_application_watch_t *watch =
         require_live_watch ? application_find_watch_locked(application, project_name) : NULL;
-    bool watch_live = !require_live_watch ||
-                      (watch && watch->subscribers > 0 && strcmp(watch->root, canonical_root) == 0);
+    bool watch_live =
+        !require_live_watch || (watch && (watch->subscribers > 0 || watch->daemon_db_path) &&
+                                strcmp(watch->root, canonical_root) == 0);
+    if (watch_live && watch && watch->daemon_db_path) {
+        /* Do not recreate a deleted index from an old poll snapshot, or queue
+         * behind a delete/import that already owns the mutation reservation. */
+        struct stat status;
+        watch_live = !application_mutation_conflicts_locked(application, project_key) &&
+                     stat(watch->daemon_db_path, &status) == 0 && S_ISREG(status.st_mode);
+    }
     size_t watch_owner_count = 0;
     bool watch_subscriptions_ok = true;
     cbm_daemon_application_job_t *job =
@@ -3491,7 +3650,7 @@ static int application_background_index(cbm_daemon_application_t *application,
                                                       args, &subscribe_status)
                    : NULL;
     if (job && require_live_watch) {
-        watch_subscriptions_ok = application_watch_job_subscribe_sessions_locked(
+        watch_subscriptions_ok = application_watch_job_subscribe_owners_locked(
             application, watch, job, &watch_owner_count);
         if (watch_subscriptions_ok && watch_owner_count > 0) {
             job->watcher_waiters++;
@@ -3499,8 +3658,8 @@ static int application_background_index(cbm_daemon_application_t *application,
             subscribe_status = APPLICATION_JOB_SUBSCRIBE_ALLOCATION_FAILED;
         }
         /* application_job_subscribe_locked() lends the caller one ordinary
-         * subscriber. A watcher callback is only a storage waiter: exact live
-         * session subscriptions above own the physical work. */
+         * subscriber. The exact session/daemon owners above own the physical
+         * work; the callback is only a storage waiter. */
         application_job_unsubscribe_locked(job);
         if (!watch_subscriptions_ok || watch_owner_count == 0) {
             job = NULL;

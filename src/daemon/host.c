@@ -81,6 +81,7 @@ typedef struct {
 struct host_state {
     /* Mirrors cbm_daemon_host_config_t.permanent for prepare-time consumers. */
     bool permanent;
+    uint64_t next_watch_refresh_ms;
     cbm_daemon_application_t *application;
     cbm_watcher_t *watcher;
     cbm_store_t *watch_store;
@@ -295,9 +296,26 @@ static int host_lifetime_reservation_acquire(
 #endif
 }
 
+static void host_refresh_watches(void *opaque);
+
 static void *host_watcher_thread(void *opaque) {
-    cbm_watcher_run(opaque, HOST_WATCH_INTERVAL_MS);
+    host_state_t *host = opaque;
+    cbm_watcher_run(host->watcher, HOST_WATCH_INTERVAL_MS, host_refresh_watches, host);
     return NULL;
+}
+
+/* Periodic reconciliation also picks up index/import/delete operations from
+ * every frontend without coupling watch ownership to individual tool handlers. */
+static void host_refresh_watches(void *opaque) {
+    host_state_t *host = opaque;
+    if (!host->permanent || cbm_now_ms() < host->next_watch_refresh_ms) {
+        return;
+    }
+    const uint32_t refresh_interval_ms = 30000;
+    host->next_watch_refresh_ms = host_deadline_after(refresh_interval_ms);
+    if (!cbm_daemon_application_reconcile_watches(host->application)) {
+        cbm_log_warn("daemon.watch.refresh_failed", "action", "retry");
+    }
 }
 
 static void *host_http_thread(void *opaque) {
@@ -858,7 +876,7 @@ static bool host_background_start(host_state_t *host) {
     /* No watcher object when watcher_enabled=false (#335) — nothing to run, and
      * the daemon must still come up with its remaining subsystems. */
     if (host->watcher) {
-        if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host->watcher) != 0) {
+        if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host) != 0) {
             return false;
         }
         host->watcher_started = true;

@@ -85,6 +85,14 @@ char *cbm_mcp_tools_help_list(void);
  * (used for protocol version negotiation). Returns heap-allocated JSON. */
 char *cbm_mcp_initialize_response(const char *params_json);
 
+/* Visit cached project identities without JSON, graph counts, or Git probes.
+ * Names, roots, and database paths are borrowed for the callback. Invalid/internal databases
+ * are skipped as in list_projects. False means enumeration or the visitor
+ * failed; callers must not treat a partial visit as a complete project set. */
+typedef bool (*cbm_mcp_project_visitor_fn)(const char *name, const char *root, const char *db_path,
+                                           void *context);
+bool cbm_mcp_visit_cached_projects(cbm_mcp_project_visitor_fn visitor, void *context);
+
 /* ── Tool argument helpers ────────────────────────────────────── */
 
 /* Extract a string argument from the tools/call params JSON.

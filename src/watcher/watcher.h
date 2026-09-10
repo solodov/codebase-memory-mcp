@@ -70,6 +70,10 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
  * current poll snapshot is invalidated before this function returns. */
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
 
+/* Request one catch-up index even for a clean Git tree. Thread-safe; retries
+ * until indexing succeeds, without losing requests made during an index. */
+void cbm_watcher_request_catch_up(cbm_watcher_t *w, const char *project_name);
+
 /* Refresh a project's timestamp (resets adaptive backoff). */
 void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
 
@@ -79,9 +83,13 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
  * Returns the number of projects that were reindexed. */
 int cbm_watcher_poll_once(cbm_watcher_t *w);
 
-/* Run the blocking poll loop. Polls every base_interval_ms until
- * cbm_watcher_stop() is called. Returns 0 on clean shutdown. */
-int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
+/* Run the blocking poll loop until stopped. Optional refresh runs before each
+ * poll on this same thread; its context must outlive the loop. Returns 0 on
+ * clean shutdown. This lets the daemon reconcile its owned watch set without
+ * another thread or watcher knowledge of client/project ownership. */
+typedef void (*cbm_watcher_refresh_fn)(void *context);
+int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms, cbm_watcher_refresh_fn refresh,
+                    void *context);
 
 /* Request the run loop to stop (thread-safe). */
 void cbm_watcher_stop(cbm_watcher_t *w);

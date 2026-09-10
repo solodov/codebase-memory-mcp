@@ -3713,6 +3713,203 @@ TEST(daemon_application_cancel_drops_watch_before_inflight_request_returns) {
     PASS();
 }
 
+/* Real cache metadata, rather than the empty DB used by session-only fakes. */
+static bool app_write_cached_project(const char *path, const char *project, const char *root) {
+    cbm_store_t *store = cbm_store_open_path(path);
+    bool ok = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return ok;
+}
+
+TEST(daemon_application_permanent_discovers_and_removes_projects_without_sessions) {
+    app_watch_race_fixture_t fixture;
+    bool ready = app_watch_race_fixture_init(&fixture, 401);
+    bool metadata =
+        ready && app_write_cached_project(fixture.db_path, fixture.project, fixture.root);
+    /* Temporary daemons must not acquire an extra owner from cache discovery. */
+    bool temporary = metadata && cbm_daemon_application_reconcile_watches(fixture.application);
+    fixture.callbacks.session_cancel(fixture.callbacks.context, fixture.session);
+    int temporary_count = cbm_watcher_watch_count(fixture.watcher);
+    fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+    fixture.session = NULL;
+    /* Use a fresh application, as final session cancellation latches stopping. */
+    bool freed = cbm_daemon_application_free(fixture.application);
+    fixture.application = NULL;
+    cbm_config_t *config = cbm_config_open(fixture.cache);
+    bool configured = config && cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+    cbm_daemon_application_config_t options = {.watcher = fixture.watcher, .config = config};
+    fixture.application = cbm_daemon_application_new(&options);
+    fixture.callbacks = cbm_daemon_application_runtime_callbacks(fixture.application);
+    cbm_daemon_application_set_permanent(fixture.application, true);
+    bool restored = cbm_daemon_application_reconcile_watches(fixture.application);
+    int restored_count = cbm_watcher_watch_count(fixture.watcher);
+
+    /* A full session with auto_watch=false must not remove the daemon owner. */
+    fixture.session = app_test_open(&fixture.callbacks, 404);
+    uint8_t *context = NULL, *ping = NULL, *response = NULL;
+    uint32_t context_length = 0, ping_length = 0, response_length = 0;
+    bool encoded =
+        app_test_context_request(fixture.root, fixture.root, &context, &context_length) &&
+        app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
+                              "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}", &ping,
+                              &ping_length);
+    bool connected =
+        encoded && fixture.session &&
+        app_test_request(&fixture.callbacks, fixture.session, context, context_length, &response,
+                         &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    connected = connected &&
+                app_test_request(&fixture.callbacks, fixture.session, ping, ping_length, &response,
+                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    free(context);
+    free(ping);
+    fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+    fixture.session = NULL;
+    int after_session = cbm_watcher_watch_count(fixture.watcher);
+
+    char other_db[APP_TEST_PATH_CAP];
+    snprintf(other_db, sizeof(other_db), "%s/renamed-cache.db", fixture.cache);
+    bool added = app_write_cached_project(other_db, "custom-project", fixture.root) &&
+                 cbm_daemon_application_reconcile_watches(fixture.application);
+    int added_count = cbm_watcher_watch_count(fixture.watcher);
+    bool repeated = cbm_daemon_application_reconcile_watches(fixture.application);
+    int repeated_count = cbm_watcher_watch_count(fixture.watcher);
+
+    bool deleted = cbm_unlink(fixture.db_path) == 0;
+    /* A preselected callback must not recreate the DB before reconciliation. */
+    int stale_result =
+        cbm_daemon_application_watcher_index(fixture.project, fixture.root, fixture.application);
+    bool removed = cbm_daemon_application_reconcile_watches(fixture.application);
+    int remaining = cbm_watcher_watch_count(fixture.watcher);
+    bool custom_deleted =
+        cbm_unlink(other_db) == 0 && cbm_daemon_application_reconcile_watches(fixture.application);
+    int empty_count = cbm_watcher_watch_count(fixture.watcher);
+    bool stopped = cbm_daemon_application_free(fixture.application);
+    fixture.application = NULL;
+    cbm_config_close(config);
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready && metadata && temporary && freed && configured);
+    ASSERT_EQ(temporary_count, 0);
+    ASSERT_TRUE(restored);
+    ASSERT_EQ(restored_count, 1);
+    ASSERT_TRUE(connected);
+    ASSERT_EQ(after_session, 1);
+    ASSERT_TRUE(added && repeated);
+    ASSERT_EQ(added_count, 2);
+    ASSERT_EQ(repeated_count, 2);
+    ASSERT_TRUE(deleted && removed && custom_deleted);
+    ASSERT_EQ(stale_result, 1);
+    ASSERT_EQ(remaining, 1);
+    ASSERT_EQ(empty_count, 0);
+    ASSERT_TRUE(stopped && cleaned);
+    PASS();
+}
+
+TEST(daemon_application_permanent_job_survives_disconnect_but_drains_on_shutdown) {
+    app_watch_race_fixture_t fixture;
+    bool ready = app_watch_race_fixture_init(&fixture, 402);
+    cbm_daemon_application_set_permanent(fixture.application, true);
+    bool restored = ready &&
+                    app_write_cached_project(fixture.db_path, fixture.project, fixture.root) &&
+                    cbm_daemon_application_reconcile_watches(fixture.application);
+    app_watcher_index_thread_t request = {
+        .application = fixture.application,
+        .project = fixture.project,
+        .root = fixture.root,
+        .result = -1,
+    };
+    atomic_init(&request.ready, false);
+    atomic_init(&request.proceed, true);
+    atomic_init(&request.done, false);
+    cbm_thread_t thread;
+    bool started =
+        restored && cbm_thread_create(&thread, 0, app_watcher_index_thread, &request) == 0;
+    bool running = started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    size_t initial_owners =
+        cbm_daemon_application_job_subscribers(fixture.application, fixture.project);
+    fixture.callbacks.session_cancel(fixture.callbacks.context, fixture.session);
+    fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+    fixture.session = NULL;
+    size_t remaining_owners =
+        cbm_daemon_application_job_subscribers(fixture.application, fixture.project);
+    int remaining_watches = cbm_watcher_watch_count(fixture.watcher);
+    int disconnect_cancels = atomic_load(&fixture.fake.cancels);
+    atomic_store(&fixture.fake.allow_completion, true);
+    bool joined = started && cbm_thread_join(&thread) == 0;
+    int first_result = request.result;
+
+    /* This second job starts with no sessions at all. Shutdown must still
+     * contain its worker and release the callback's storage waiter. */
+    atomic_store(&fixture.fake.allow_completion, false);
+    atomic_store(&request.done, false);
+    request.result = -1;
+    bool restarted =
+        joined && cbm_thread_create(&thread, 0, app_watcher_index_thread, &request) == 0;
+    bool running_without_clients = restarted && app_wait_for_atomic_int(&fixture.fake.starts, 2);
+    bool drained = cbm_daemon_application_shutdown(fixture.application, APP_TEST_TIMEOUT_MS);
+    bool shutdown_joined = restarted && cbm_thread_join(&thread) == 0;
+    int shutdown_result = request.result;
+    int cancels = atomic_load(&fixture.fake.cancels);
+    int destroys = atomic_load(&fixture.fake.destroys);
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready && restored && started && running && joined);
+    ASSERT_EQ(initial_owners, 2);
+    ASSERT_EQ(remaining_owners, 1);
+    ASSERT_EQ(remaining_watches, 1);
+    ASSERT_EQ(disconnect_cancels, 0);
+    ASSERT_EQ(first_result, 0);
+    ASSERT_TRUE(running_without_clients && drained && shutdown_joined);
+    ASSERT_EQ(shutdown_result, 1);
+    ASSERT_EQ(cancels, 1);
+    ASSERT_EQ(destroys, 2);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+TEST(daemon_application_permanent_discovery_rejects_unsafe_roots_and_disabled_watcher) {
+    app_watch_race_fixture_t fixture;
+    bool ready = app_watch_race_fixture_init(&fixture, 403);
+    cbm_daemon_application_set_permanent(fixture.application, true);
+    fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+    fixture.session = NULL;
+    char sensitive[APP_TEST_PATH_CAP];
+    snprintf(sensitive, sizeof(sensitive), "%s/.ssh", fixture.root);
+    bool unsafe = ready && cbm_mkdir(sensitive) == 0 &&
+                  app_write_cached_project(fixture.db_path, fixture.project, sensitive) &&
+                  cbm_daemon_application_reconcile_watches(fixture.application);
+    int unsafe_count = cbm_watcher_watch_count(fixture.watcher);
+    bool metadata = app_write_cached_project(fixture.db_path, fixture.project, fixture.root);
+    cbm_daemon_application_t *disabled = cbm_daemon_application_new(NULL);
+    cbm_daemon_application_set_permanent(disabled, true);
+    bool disabled_ok = cbm_daemon_application_reconcile_watches(disabled);
+    int disabled_count = cbm_watcher_watch_count(fixture.watcher);
+    bool disabled_freed = cbm_daemon_application_free(disabled);
+    bool restored = cbm_daemon_application_reconcile_watches(fixture.application);
+    int restored_count = cbm_watcher_watch_count(fixture.watcher);
+    /* Enumeration failure must preserve existing owners. */
+    char absent[APP_TEST_PATH_CAP];
+    snprintf(absent, sizeof(absent), "%s/absent", fixture.cache);
+    bool switched = cbm_setenv("CBM_CACHE_DIR", absent, 1) == 0;
+    bool failed = !cbm_daemon_application_reconcile_watches(fixture.application);
+    int preserved_count = cbm_watcher_watch_count(fixture.watcher);
+    bool reset = cbm_setenv("CBM_CACHE_DIR", fixture.cache, 1) == 0;
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready && unsafe && metadata);
+    ASSERT_EQ(unsafe_count, 0);
+    ASSERT_TRUE(disabled_ok && disabled_freed);
+    ASSERT_EQ(disabled_count, 0);
+    ASSERT_TRUE(restored && switched && failed && reset);
+    ASSERT_EQ(restored_count, 1);
+    ASSERT_EQ(preserved_count, 1);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
 TEST(daemon_application_stale_watcher_callback_is_rejected_at_job_admission) {
     app_watch_race_fixture_t fixture;
     bool fixture_ready = app_watch_race_fixture_init(&fixture, 40);
@@ -5586,6 +5783,9 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session);
     RUN_TEST(daemon_application_cancel_before_worker_start_skips_worker);
     RUN_TEST(daemon_application_cancel_drops_watch_before_inflight_request_returns);
+    RUN_TEST(daemon_application_permanent_discovers_and_removes_projects_without_sessions);
+    RUN_TEST(daemon_application_permanent_job_survives_disconnect_but_drains_on_shutdown);
+    RUN_TEST(daemon_application_permanent_discovery_rejects_unsafe_roots_and_disabled_watcher);
     RUN_TEST(daemon_application_stale_watcher_callback_is_rejected_at_job_admission);
     RUN_TEST(daemon_application_final_cancel_drains_admitted_watcher_job);
     RUN_TEST(daemon_application_watcher_job_follows_exact_live_watch_owners);

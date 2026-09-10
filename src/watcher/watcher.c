@@ -56,6 +56,7 @@ typedef struct {
      * released. Unwatch/replacement tombstones a removed state so a later
      * snapshot entry cannot admit new indexing work. */
     atomic_bool registered;
+    atomic_bool catch_up;
     /* Published only while one supervised Git command is active. Access is
      * serialized by watcher->projects_lock; cancellation itself is atomic. */
     cbm_subprocess_t *active_git;
@@ -827,6 +828,7 @@ static project_state_t *state_new(const char *name, const char *root_path) {
         return NULL;
     }
     atomic_init(&s->registered, true);
+    atomic_init(&s->catch_up, false);
     s->interval_ms = POLL_BASE_MS;
     return s;
 }
@@ -1112,6 +1114,18 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     }
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
     return true;
+}
+
+void cbm_watcher_request_catch_up(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *state = cbm_ht_get(w->projects, project_name);
+    if (state) {
+        atomic_store_explicit(&state->catch_up, true, memory_order_release);
+    }
+    cbm_mutex_unlock(&w->projects_lock);
 }
 
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
@@ -1432,7 +1446,7 @@ static void poll_project(const char *key, void *val, void *ud) {
     if (!check_changes(ctx->w, s, &changed)) {
         return;
     }
-    if (!changed) {
+    if (!changed && !atomic_load_explicit(&s->catch_up, memory_order_acquire)) {
         s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
         return;
     }
@@ -1446,7 +1460,11 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
     cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
     if (ctx->w->index_fn) {
+        bool catch_up = atomic_exchange_explicit(&s->catch_up, false, memory_order_acq_rel);
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
+        if (rc != 0 && catch_up) {
+            atomic_store_explicit(&s->catch_up, true, memory_order_release);
+        }
         if (rc == 0) {
             ctx->reindexed++;
             /* Commit the baselines OBSERVED AT CHECK TIME — the state whose
@@ -1557,7 +1575,8 @@ void cbm_watcher_stop(cbm_watcher_t *w) {
     }
 }
 
-int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
+int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms, cbm_watcher_refresh_fn refresh,
+                    void *context) {
     if (!w) {
         return CBM_NOT_FOUND;
     }
@@ -1568,6 +1587,9 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
     cbm_log_info("watcher.start", "interval_ms", base_interval_ms > 999 ? "multi-sec" : "fast");
 
     while (!atomic_load(&w->stopped)) {
+        if (refresh) {
+            refresh(context);
+        }
         cbm_watcher_poll_once(w);
 
         /* Sleep in small increments to allow responsive shutdown */

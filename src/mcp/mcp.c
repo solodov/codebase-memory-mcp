@@ -2796,6 +2796,66 @@ static project_record_status_t read_project_record_identity(const char *dir_path
     return PROJECT_RECORD_OK;
 }
 
+bool cbm_mcp_visit_cached_projects(cbm_mcp_project_visitor_fn visitor, void *context) {
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *directory = visitor ? cbm_opendir(dir_path) : NULL;
+    if (!directory) {
+        return false;
+    }
+    bool ok = true;
+    for (;;) {
+        errno = 0;
+        cbm_dirent_t *entry = cbm_readdir(directory);
+        if (!entry) {
+            ok = errno == 0;
+            break;
+        }
+        if (!is_project_db_file(entry->name, strlen(entry->name))) {
+            continue;
+        }
+        mcp_project_record_t record = {0};
+        project_record_status_t status =
+            read_project_record_identity(dir_path, entry->name, 0, &record);
+        if (status == PROJECT_RECORD_SKIP) {
+            continue;
+        }
+        /* Match query resolution: a canonical database takes precedence over
+         * renamed copies of the same internal project. Otherwise a stale copy
+         * could enroll a different root and overwrite the current index. */
+        if (status == PROJECT_RECORD_OK && cbm_validate_project_name(record.name)) {
+            char canonical_file[CBM_SZ_2K];
+            snprintf(canonical_file, sizeof(canonical_file), "%s.db", record.name);
+            if (strcmp(canonical_file, entry->name) != 0) {
+                mcp_project_record_t canonical = {0};
+                project_record_status_t canonical_status =
+                    read_project_record_identity(dir_path, canonical_file, 0, &canonical);
+                bool preferred = canonical_status == PROJECT_RECORD_OK &&
+                                 strcmp(canonical.name, record.name) == 0;
+                project_record_clear(&canonical);
+                if (preferred || canonical_status == PROJECT_RECORD_OOM) {
+                    project_record_clear(&record);
+                    if (canonical_status == PROJECT_RECORD_OOM) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        char db_path[CBM_SZ_2K];
+        int written = snprintf(db_path, sizeof(db_path), "%s/%s", dir_path, entry->name);
+        ok = status == PROJECT_RECORD_OK && written > 0 && written < (int)sizeof(db_path) &&
+             visitor(record.name, record.root_path, db_path, context);
+        project_record_clear(&record);
+        if (!ok) {
+            break;
+        }
+    }
+    cbm_closedir(directory);
+    return ok;
+}
+
 static bool populate_project_record(const char *dir_path, bool include_stats,
                                     mcp_project_record_t *record) {
     if (record->populated) {
